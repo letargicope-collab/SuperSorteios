@@ -65,6 +65,11 @@ type ApiCommentsResponse = {
   truncated?: boolean;
   message?: string;
   error?: string;
+  runId?: string;
+  datasetId?: string;
+  status?: string;
+  maxTotalChargeUsd?: number;
+  sourceError?: { code?: string; message?: string };
 };
 type IconName =
   | "instagram"
@@ -238,6 +243,50 @@ function mapApiParticipants(
     isReply: person.isReply,
     commentUrl: person.commentUrl,
   }] : []);
+}
+
+function wait(milliseconds: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, milliseconds));
+}
+
+function collectionCapUsd(maxComments: number): number {
+  // Safety cap with headroom above the Actor's highest published per-row
+  // price, so the run is not stopped early by an underestimated cap.
+  return Math.max(0.02, maxComments * 0.0006 + 0.01);
+}
+
+function alternatePostUrl(url: string): string {
+  const match = url.match(/instagram\.com\/(reel|tv)\/([a-z\d_-]+)\//i);
+  return match ? `https://www.instagram.com/p/${match[2]}/` : url;
+}
+
+function errorFromResponse(data: ApiCommentsResponse, fallback: string): Error & { data?: ApiCommentsResponse } {
+  const error = new Error(data.error || fallback) as Error & { data?: ApiCommentsResponse };
+  error.data = data;
+  return error;
+}
+
+function isRetryableCollectionError(error: unknown): boolean {
+  const data = (error as { data?: ApiCommentsResponse } | null)?.data;
+  const code = (data?.sourceError?.code || "").toLowerCase();
+  const message = `${data?.sourceError?.message || ""} ${data?.error || ""}`.toLowerCase();
+  if (!data?.sourceError && !data?.error) return false;
+  if (code.includes("private") || code.includes("invalid") || code.includes("charge") || code.includes("limit")) {
+    return false;
+  }
+  return (
+    code.includes("no_items") ||
+    code.includes("no_comments") ||
+    code.includes("no_results") ||
+    code.includes("not_found") ||
+    code.includes("partial") ||
+    code.includes("block") ||
+    code.includes("rate") ||
+    code.includes("tempor") ||
+    code.includes("provider") ||
+    message.includes("bloqueio tempor") ||
+    message.includes("temporar")
+  );
 }
 
 function parseParticipantText(value: string): ParsedImport {
@@ -626,6 +675,69 @@ export default function RaffleApp() {
     notify("Modo demonstração carregado — os perfis e comentários são fictícios.");
   }
 
+  async function fetchCommentsOnce(
+    url: string,
+    commentsLimit: number,
+    withReplies: boolean,
+  ): Promise<ApiCommentsResponse> {
+    const startResponse = await fetch("/api/instagram-comments", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ url, maxComments: commentsLimit, includeReplies: withReplies }),
+    });
+    const started = (await startResponse.json()) as ApiCommentsResponse;
+    if (!startResponse.ok) {
+      throw errorFromResponse(started, "Não foi possível iniciar a coleta.");
+    }
+    if (started.mode !== "apify_pending") return started;
+    if (!started.runId) throw new Error("A Apify não retornou o identificador da coleta.");
+
+    const deadline = Date.now() + 15 * 60 * 1000;
+    let pollCount = 0;
+    let transientFailures = 0;
+    while (Date.now() < deadline) {
+      await wait(pollCount < 6 ? 3000 : 5000);
+      pollCount += 1;
+      try {
+        const pollResponse = await fetch(
+          `/api/instagram-comments?runId=${encodeURIComponent(started.runId)}&maxComments=${commentsLimit}`,
+          { cache: "no-store" },
+        );
+        const data = (await pollResponse.json()) as ApiCommentsResponse;
+        if (!pollResponse.ok) {
+          // A finished run with a source error is final; a bare 5xx while
+          // polling may be a transient serverless/network hiccup.
+          if (data.sourceError || transientFailures >= 3) {
+            throw errorFromResponse(data, "Não foi possível acompanhar a coleta na Apify.");
+          }
+          transientFailures += 1;
+          continue;
+        }
+        transientFailures = 0;
+        if (data.mode !== "apify_pending") return data;
+      } catch (error) {
+        if ((error as { data?: ApiCommentsResponse })?.data?.sourceError) throw error;
+        transientFailures += 1;
+        if (transientFailures > 3) throw error;
+      }
+    }
+
+    throw new Error(
+      "A coleta está demorando mais que o esperado. Ela pode continuar na Apify; tente atualizar em alguns minutos ou reduza o máximo de comentários.",
+    );
+  }
+
+  async function collectComments(url: string): Promise<ApiCommentsResponse> {
+    try {
+      return await fetchCommentsOnce(url, maxComments, includeReplies);
+    } catch (error) {
+      if (!isRetryableCollectionError(error)) throw error;
+      notify("A primeira leitura não retornou comentários. Tentando uma segunda leitura…");
+      const retryUrl = alternatePostUrl(url);
+      return fetchCommentsOnce(retryUrl, maxComments, true);
+    }
+  }
+
   async function analyzePost(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     setFormError("");
@@ -637,25 +749,7 @@ export default function RaffleApp() {
 
     setIsLoading(true);
     try {
-      const response = await fetch("/api/instagram-comments", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ url: normalized, maxComments, includeReplies }),
-      });
-      const data = (await response.json()) as ApiCommentsResponse;
-      if (!response.ok) {
-        const message = data.error || "Não foi possível coletar os comentários desse link.";
-        setSourceUrl(normalized);
-        setSourceMode("manual");
-        setParticipants([]);
-        setPostCaption("");
-        setImportText("");
-        setShowImport(true);
-        setSourceMessage(`${message} Você pode continuar pela importação manual.`);
-        setStage("setup");
-        return;
-      }
-
+      const data = await collectComments(normalized);
       const received = mapApiParticipants(data.participants ?? [], "api");
       setUrlInput(data.url || normalized);
       setSourceUrl(data.url || normalized);
@@ -672,8 +766,19 @@ export default function RaffleApp() {
       setDrawId("");
       setStage("setup");
       if (received.length > 0) notify(`${received.length.toLocaleString("pt-BR")} comentários carregados.`);
-    } catch {
-      setFormError("Não conseguimos consultar o serviço agora. Tente novamente ou carregue a demonstração.");
+    } catch (error) {
+      const message =
+        error instanceof Error
+          ? error.message
+          : "Não conseguimos consultar o serviço agora. Tente novamente ou carregue a demonstração.";
+      setSourceUrl(normalized);
+      setSourceMode("manual");
+      setParticipants([]);
+      setPostCaption("");
+      setImportText("");
+      setShowImport(true);
+      setSourceMessage(`${message} Você pode continuar pela importação manual.`);
+      setStage("setup");
     } finally {
       setIsLoading(false);
     }
@@ -704,24 +809,14 @@ export default function RaffleApp() {
       return;
     }
     if (!sourceUrl) return;
-    const estimatedCap = Math.max(0.01, maxComments * 0.00039 + 0.0005);
+    const estimatedCap = collectionCapUsd(maxComments);
     const confirmed = window.confirm(
-      `Esta atualização executará o Actor da Apify novamente. O teto conservador desta execução é US$ ${estimatedCap.toFixed(3).replace(".", ",")}, e a cobrança real depende do seu plano e das linhas retornadas. Deseja continuar?`,
+      `Esta atualização executará o Actor da Apify novamente. O teto de segurança desta execução é US$ ${estimatedCap.toFixed(3).replace(".", ",")}, e a cobrança real depende do seu plano e das linhas retornadas. Deseja continuar?`,
     );
     if (!confirmed) return;
     setIsRefreshing(true);
     try {
-      const response = await fetch("/api/instagram-comments", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ url: sourceUrl, maxComments, includeReplies }),
-      });
-      const data = (await response.json()) as ApiCommentsResponse;
-      if (!response.ok) {
-        setSourceMessage(data.error || "A Apify não conseguiu atualizar os comentários.");
-        notify(data.error || "Não foi possível atualizar os comentários.");
-        return;
-      }
+      const data = await collectComments(sourceUrl);
       if (data.mode === "apify") {
         const refreshed = mapApiParticipants(data.participants ?? [], "refresh");
         setParticipants(refreshed);
@@ -734,8 +829,10 @@ export default function RaffleApp() {
         setSourceMessage(data.message || "A coleta automática não está configurada neste ambiente.");
         notify("Configure a Apify ou importe uma lista atualizada.");
       }
-    } catch {
-      notify("Não foi possível atualizar agora. Você pode importar uma lista manualmente.");
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Não foi possível atualizar agora.";
+      setSourceMessage(message);
+      notify(message);
     } finally {
       setIsRefreshing(false);
     }
@@ -1125,7 +1222,7 @@ export default function RaffleApp() {
                     <label className="collection-limit" htmlFor="max-comments"><span>Máximo de comentários</span><input id="max-comments" type="number" min={20} max={5000} step={10} value={maxComments} onChange={(event) => setMaxComments(Math.min(5000, Math.max(20, Number(event.target.value) || 20)))} /></label>
                     <label className="collection-replies"><input type="checkbox" checked={includeReplies} onChange={(event) => setIncludeReplies(event.target.checked)} /><span><strong>Incluir respostas</strong><small>Mesma tarifa por linha</small></span></label>
                   </div>
-                  <p className="cost-note"><Icon name="info" size={13} /><span>Execução pelo Actor <strong>Instagram Data API</strong> na Apify. Cobrança por comentário/resposta retornado + US$ 0,0005 por execução. Teto conservador desta coleta: <strong>US$ {Math.max(0.01, maxComments * 0.00039 + 0.0005).toFixed(3).replace(".", ",")}</strong>; o valor real depende do seu plano.</span></p>
+                  <p className="cost-note"><Icon name="info" size={13} /><span>Execução pelo Actor <strong>Instagram Data API</strong> na Apify. Cobrança por comentário/resposta retornado + US$ 0,0005 por execução. Teto de segurança desta coleta: <strong>US$ {collectionCapUsd(maxComments).toFixed(3).replace(".", ",")}</strong> (com margem sobre a tarifa por linha, para a coleta não parar por limite baixo); o valor real depende do seu plano.</span></p>
                   {formError && <p className="error-text" id="link-error" role="alert">{formError}</p>}
                   <div className="form-actions">
                     <button className="demo-button" type="button" onClick={loadDemo}><Icon name="play" size={14} /> Testar com uma demonstração</button>

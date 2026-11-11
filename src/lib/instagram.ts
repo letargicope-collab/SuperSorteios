@@ -14,10 +14,11 @@ export function normalizeInstagramPostUrl(value: string): string | null {
   if (!INSTAGRAM_HOSTS.has(parsed.hostname.toLowerCase())) return null;
   if (parsed.username || parsed.password || (parsed.port && parsed.port !== "443")) return null;
 
-  const match = parsed.pathname.match(/^\/(p|reel|tv)\/([a-z\d_-]+)\/?$/i);
+  const match = parsed.pathname.match(/^\/(p|reels?|tv)\/([a-z\d_-]+)\/?$/i);
   if (!match) return null;
 
-  return `https://www.instagram.com/${match[1].toLowerCase()}/${match[2]}/`;
+  const type = match[1].toLowerCase() === "reels" ? "reel" : match[1].toLowerCase();
+  return `https://www.instagram.com/${type}/${match[2]}/`;
 }
 
 export function instagramPostKey(value: string): string | null {
