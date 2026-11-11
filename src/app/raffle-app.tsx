@@ -249,10 +249,12 @@ function wait(milliseconds: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, milliseconds));
 }
 
-function collectionCapUsd(maxComments: number): number {
-  // Safety cap with headroom above the Actor's highest published per-row
-  // price, so the run is not stopped early by an underestimated cap.
-  return Math.max(0.02, maxComments * 0.0006 + 0.01);
+function collectionCapUsd(maxComments: number, withReplies = false): number {
+  // Chronometrica charges per saved comment/reply row (no start fee). The
+  // limit applies to top-level comments; replies can add up to 10 rows per
+  // parent, so the safety cap considers that documented worst case.
+  const maxRows = maxComments * (withReplies ? 11 : 1);
+  return Math.max(0.05, maxRows * 0.0022 + 0.01);
 }
 
 function alternatePostUrl(url: string): string {
@@ -278,6 +280,8 @@ function isRetryableCollectionError(error: unknown): boolean {
     code.includes("no_items") ||
     code.includes("no_comments") ||
     code.includes("no_results") ||
+    code.includes("unavailable") ||
+    code.includes("failed") ||
     code.includes("not_found") ||
     code.includes("partial") ||
     code.includes("block") ||
@@ -700,7 +704,7 @@ export default function RaffleApp() {
       pollCount += 1;
       try {
         const pollResponse = await fetch(
-          `/api/instagram-comments?runId=${encodeURIComponent(started.runId)}&maxComments=${commentsLimit}`,
+          `/api/instagram-comments?runId=${encodeURIComponent(started.runId)}&maxComments=${commentsLimit}&includeReplies=${withReplies}`,
           { cache: "no-store" },
         );
         const data = (await pollResponse.json()) as ApiCommentsResponse;
@@ -809,7 +813,7 @@ export default function RaffleApp() {
       return;
     }
     if (!sourceUrl) return;
-    const estimatedCap = collectionCapUsd(maxComments);
+    const estimatedCap = collectionCapUsd(maxComments, includeReplies);
     const confirmed = window.confirm(
       `Esta atualização executará o Actor da Apify novamente. O teto de segurança desta execução é US$ ${estimatedCap.toFixed(3).replace(".", ",")}, e a cobrança real depende do seu plano e das linhas retornadas. Deseja continuar?`,
     );
@@ -1219,10 +1223,10 @@ export default function RaffleApp() {
                     </button>
                   </div>
                   <div className="collection-options">
-                    <label className="collection-limit" htmlFor="max-comments"><span>Máximo de comentários</span><input id="max-comments" type="number" min={20} max={5000} step={10} value={maxComments} onChange={(event) => setMaxComments(Math.min(5000, Math.max(20, Number(event.target.value) || 20)))} /></label>
+                    <label className="collection-limit" htmlFor="max-comments"><span>Máximo de comentários principais</span><input id="max-comments" type="number" min={20} max={5000} step={10} value={maxComments} onChange={(event) => setMaxComments(Math.min(5000, Math.max(20, Number(event.target.value) || 20)))} /></label>
                     <label className="collection-replies"><input type="checkbox" checked={includeReplies} onChange={(event) => setIncludeReplies(event.target.checked)} /><span><strong>Incluir respostas</strong><small>Mesma tarifa por linha</small></span></label>
                   </div>
-                  <p className="cost-note"><Icon name="info" size={13} /><span>Execução pelo Actor <strong>Instagram Data API</strong> na Apify. Cobrança por comentário/resposta retornado + US$ 0,0005 por execução. Teto de segurança desta coleta: <strong>US$ {collectionCapUsd(maxComments).toFixed(3).replace(".", ",")}</strong> (com margem sobre a tarifa por linha, para a coleta não parar por limite baixo); o valor real depende do seu plano.</span></p>
+                  <p className="cost-note"><Icon name="info" size={13} /><span>Execução pelo Actor <strong>Chronometrica</strong> na Apify. Cobrança por comentário/resposta salvo, sem taxa de início. Teto de segurança desta coleta: <strong>US$ {collectionCapUsd(maxComments, includeReplies).toFixed(3).replace(".", ",")}</strong> (com margem sobre a tarifa por linha; com respostas, o limite é de comentários principais e as respostas são linhas separadas); o valor real depende do seu plano.</span></p>
                   {formError && <p className="error-text" id="link-error" role="alert">{formError}</p>}
                   <div className="form-actions">
                     <button className="demo-button" type="button" onClick={loadDemo}><Icon name="play" size={14} /> Testar com uma demonstração</button>

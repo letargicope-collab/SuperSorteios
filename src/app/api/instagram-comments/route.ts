@@ -6,13 +6,16 @@ export const dynamic = "force-dynamic";
 // serverless invocations stay short even when the Actor takes minutes.
 export const maxDuration = 60;
 
-const ACTOR_ID = "instagram-data-api~instagram-comments-scraper";
+const ACTOR_ID = "chronometrica~instagram-comments-scraper";
+const ACTOR_NAME = "chronometrica/instagram-comments-scraper";
 const APIFY_API = "https://api.apify.com/v2";
 const MAX_COMMENTS = 5000;
-// Highest current per-comment event price published for this Actor is
-// US$ 0.000504. We cap with headroom so a low cap cannot stop the run early;
-// the cap is a safety limit, not the expected charge.
-const PER_COMMENT_CAP_USD = 0.0006;
+const MAX_REPLIES_PER_COMMENT = 10;
+// Chronometrica pricing is per saved comment/reply row, with no start fee.
+// The highest published price is US$ 0.0020 per row (Free tier). We cap with
+// headroom so a low cap cannot stop the run early; this is a safety limit,
+// not the expected charge.
+const PER_ROW_CAP_USD = 0.0022;
 const RUN_BUFFER_USD = 0.01;
 
 type ParticipantDto = {
@@ -36,6 +39,7 @@ type ApifyRun = {
   status?: string;
   statusMessage?: string;
   defaultDatasetId?: string;
+  defaultKeyValueStoreId?: string;
 };
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -56,21 +60,23 @@ function safeInteger(value: unknown, fallback: number): number {
   return Math.min(MAX_COMMENTS, Math.max(1, Math.floor(parsed)));
 }
 
-function chargeCapUsd(maxComments: number): number {
-  return Math.max(0.02, Number((maxComments * PER_COMMENT_CAP_USD + RUN_BUFFER_USD).toFixed(4)));
+function chargeCapUsd(maxComments: number, includeReplies: boolean): number {
+  // maxCommentsPerPost limits top-level comments. Replies are separate paid
+  // rows (up to MAX_REPLIES_PER_COMMENT under each saved parent), so the
+  // charge cap must consider that documented worst case.
+  const maxRows = maxComments * (includeReplies ? 1 + MAX_REPLIES_PER_COMMENT : 1);
+  return Math.max(0.05, Number((maxRows * PER_ROW_CAP_USD + RUN_BUFFER_USD).toFixed(4)));
 }
 
 function actorInput(url: string, maxComments: number, includeReplies: boolean) {
-  // Use the Actor's native, documented schema. The optional Apify-style
-  // field aliases and the summary row are not needed by this app and only
-  // add extra shapes for the parser to trip over.
+  // Chronometrica's native, documented schema.
   return {
-    urls: [url],
+    postUrls: [url],
     maxCommentsPerPost: maxComments,
     includeReplies,
-    officialFieldNames: false,
-    addSummaryRow: false,
-    includeRaw: false,
+    maxRepliesPerComment: MAX_REPLIES_PER_COMMENT,
+    commentSortMode: "default",
+    collectAllAvailable: false,
   };
 }
 
@@ -207,6 +213,10 @@ function parseRows(payload: unknown): {
     seenIds.add(id);
 
     const parentId = stringField(row, ["parentId", "parentCommentId"]);
+    const postShortCode = stringField(row, ["postShortCode", "postShortcode"]);
+    const directCommentUrl =
+      stringField(row, ["commentUrl"]) ||
+      (postShortCode ? `https://www.instagram.com/p/${postShortCode}/c/${id}/` : undefined);
     const profileImageUrl = [
       stringField(row, ["ownerProfilePicUrl", "profilePicUrl", "profileImageUrl"]),
       stringField(owner, ["profilePicUrl", "profile_pic_url", "profileImageUrl"]),
@@ -229,7 +239,7 @@ function parseRows(payload: unknown): {
         booleanField(owner, ["isVerified", "is_verified", "verified"]),
       profileImageUrl,
       isReply: booleanField(row, ["isReply", "is_reply"]) ?? Boolean(parentId),
-      commentUrl: stringField(row, ["commentUrl"]),
+      commentUrl: directCommentUrl,
     });
   });
 
@@ -239,6 +249,12 @@ function parseRows(payload: unknown): {
 function describeSourceError(error: SourceError | null): string {
   const code = (error?.code || "").toLowerCase();
   const detail = error?.message ? ` Detalhe do coletor: ${error.message}` : "";
+  if (code.includes("unavailable_or_no_public_data")) {
+    return `O Chronometrica não recebeu um feed público de comentários para esta publicação nesta leitura. Isso pode acontecer mesmo em post público quando o Instagram mostra a página, mas entrega a lista vazia para visitantes deslogados; o sistema tenta uma segunda leitura automaticamente.${detail}`;
+  }
+  if (code === "failed" || code.includes("temporary") || code.includes("provider")) {
+    return `O Chronometrica encontrou um erro temporário ao ler esta publicação e não salvou comentários. O sistema tenta uma segunda leitura automaticamente.${detail}`;
+  }
   if (code.includes("charge") || code.includes("limit") || code.includes("items")) {
     return `A coleta parou por limite antes de salvar comentários (código: ${error?.code}). Aumente o teto da coleta ou reduza o máximo de comentários.${detail}`;
   }
@@ -258,6 +274,57 @@ function describeSourceError(error: SourceError | null): string {
     return `O coletor não reconheceu este link como uma publicação/Reel válido (código: ${error?.code}). Confira se o link abre a publicação, e não um perfil, story ou página de login.${detail}`;
   }
   return `O coletor terminou sem retornar comentários utilizáveis${error?.code ? ` (código: ${error.code})` : ""}.${detail}`;
+}
+
+function summarySourceError(payload: unknown): SourceError | null {
+  let text = "";
+  if (typeof payload === "string") {
+    text = payload;
+  } else if (payload !== undefined && payload !== null) {
+    try {
+      text = JSON.stringify(payload);
+    } catch {
+      text = "";
+    }
+  }
+  const normalized = text.toLowerCase();
+  if (normalized.includes("unavailable_or_no_public_data")) {
+    return {
+      code: "unavailable_or_no_public_data",
+      message: "O Instagram não expôs um feed público de comentários para esta publicação nesta leitura.",
+    };
+  }
+  if (normalized.includes("source_exhausted")) {
+    return {
+      code: "no_items",
+      message: "O feed público terminou sem salvar comentários nesta leitura.",
+    };
+  }
+  if (normalized.includes('"failed"') || normalized.includes(" failed")) {
+    return {
+      code: "failed",
+      message: "Erro temporário ao ler esta publicação no Instagram.",
+    };
+  }
+  return null;
+}
+
+async function fetchOutputSourceError(
+  token: string,
+  keyValueStoreId: string | undefined,
+): Promise<SourceError | null> {
+  if (!keyValueStoreId) return null;
+  try {
+    const { response, payload } = await apifyJson(
+      token,
+      `/key-value-stores/${encodeURIComponent(keyValueStoreId)}/records/OUTPUT`,
+      { timeoutMs: 15_000 },
+    );
+    if (!response.ok) return null;
+    return summarySourceError(payload);
+  } catch {
+    return null;
+  }
 }
 
 export async function POST(request: Request) {
@@ -286,7 +353,7 @@ export async function POST(request: Request) {
 
   const maxComments = safeInteger(body.maxComments, 500);
   const includeReplies = body.includeReplies === true;
-  const maxTotalChargeUsd = chargeCapUsd(maxComments);
+  const maxTotalChargeUsd = chargeCapUsd(maxComments, includeReplies);
   const startPath = `/acts/${ACTOR_ID}/runs?timeout=600&maxTotalChargeUsd=${encodeURIComponent(String(maxTotalChargeUsd))}`;
 
   try {
@@ -336,7 +403,7 @@ export async function GET(request: Request) {
   if (!runId) {
     return Response.json({
       provider: "apify",
-      actor: "instagram-data-api/instagram-comments-scraper",
+      actor: ACTOR_NAME,
       tokenConfigured: Boolean(token),
       tokenVariable: process.env.APIFY_API_TOKEN?.trim()
         ? "APIFY_API_TOKEN"
@@ -357,6 +424,11 @@ export async function GET(request: Request) {
   }
 
   const maxComments = safeInteger(params.get("maxComments"), MAX_COMMENTS);
+  const includeReplies = params.get("includeReplies") === "true";
+  const datasetLimit = Math.min(
+    100_000,
+    maxComments * (includeReplies ? 1 + MAX_REPLIES_PER_COMMENT : 1),
+  );
 
   try {
     const runResult = await apifyJson(token, `/actor-runs/${encodeURIComponent(runId)}`, {
@@ -399,7 +471,7 @@ export async function GET(request: Request) {
       );
     }
 
-    const datasetPath = `/datasets/${encodeURIComponent(run.defaultDatasetId)}/items?format=json&clean=true&desc=false&limit=${maxComments}`;
+    const datasetPath = `/datasets/${encodeURIComponent(run.defaultDatasetId)}/items?format=json&clean=true&desc=false&limit=${datasetLimit}`;
     const datasetResult = await apifyJson(token, datasetPath, { timeoutMs: 30_000 });
     if (!datasetResult.response.ok) {
       return httpError(datasetResult.response.status, apifyErrorMessage(datasetResult.payload));
@@ -408,16 +480,19 @@ export async function GET(request: Request) {
     const { participants, postCaption, sourceError, ignoredErrors } = parseRows(datasetResult.payload);
 
     if (!participants.length) {
-      const message = describeSourceError(sourceError);
+      const effectiveSourceError =
+        sourceError ?? (await fetchOutputSourceError(token, run.defaultKeyValueStoreId));
+      const message = describeSourceError(effectiveSourceError);
       console.warn("Apify comments run returned no usable comments", {
+        actor: ACTOR_NAME,
         runId: run.id || runId,
         datasetId: run.defaultDatasetId,
-        sourceError,
+        sourceError: effectiveSourceError,
       });
       return Response.json(
         {
           error: message,
-          sourceError: sourceError ?? undefined,
+          sourceError: effectiveSourceError ?? undefined,
           runId: run.id || runId,
           datasetId: run.defaultDatasetId,
         },
@@ -426,7 +501,8 @@ export async function GET(request: Request) {
     }
 
     const replyCount = participants.filter((person) => person.isReply).length;
-    const message = `${participants.length.toLocaleString("pt-BR")} comentário(s) coletado(s) pela Apify${replyCount ? `, incluindo ${replyCount.toLocaleString("pt-BR")} resposta(s)` : ""}.${participants.length >= maxComments ? " O limite escolhido foi atingido; aumente-o para buscar mais." : ""}${ignoredErrors ? ` ${ignoredErrors} linha(s) sem resultado foram ignoradas.` : ""}`;
+    const topLevelCount = participants.length - replyCount;
+    const message = `${participants.length.toLocaleString("pt-BR")} comentário(s) coletado(s) pela Apify${replyCount ? `, incluindo ${replyCount.toLocaleString("pt-BR")} resposta(s)` : ""}.${topLevelCount >= maxComments ? " O limite de comentários principais foi atingido; aumente-o para buscar mais." : ""}${ignoredErrors ? ` ${ignoredErrors} linha(s) sem resultado foram ignoradas.` : ""}`;
 
     return Response.json({
       mode: "apify",
@@ -436,7 +512,7 @@ export async function GET(request: Request) {
       status: run.status,
       participants,
       postCaption,
-      truncated: participants.length >= maxComments,
+      truncated: topLevelCount >= maxComments,
       message,
     });
   } catch {
