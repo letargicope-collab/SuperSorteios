@@ -249,6 +249,29 @@ function wait(milliseconds: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, milliseconds));
 }
 
+function serverVideoId(downloadUrl: string): string | undefined {
+  return downloadUrl.match(/\/api\/export-video\/([a-f0-9]{32})/)?.[1];
+}
+
+/** Discard a generated video: revoke the browser blob and delete the server copy. */
+function releaseVideoAssets(objectUrl: string, serverDownloadUrl: string): void {
+  if (objectUrl) {
+    try {
+      URL.revokeObjectURL(objectUrl);
+    } catch {
+      // ignore
+    }
+  }
+  const id = serverVideoId(serverDownloadUrl);
+  if (id) {
+    try {
+      void fetch(`/api/export-video/${id}`, { method: "DELETE", keepalive: true }).catch(() => undefined);
+    } catch {
+      // ignore
+    }
+  }
+}
+
 function collectionCapUsd(maxComments: number, withReplies = false): number {
   // Chronometrica charges per saved comment/reply row (no start fee). The
   // limit applies to top-level comments; replies can add up to 10 rows per
@@ -529,6 +552,11 @@ export default function RaffleApp() {
   const [rollIndex, setRollIndex] = useState(0);
   const [currentRollName, setCurrentRollName] = useState("");
   const [drawOutcome, setDrawOutcome] = useState<DrawOutcome | null>(null);
+  // The drawn winner is immutable in drawOutcome (also what gets saved to the
+  // history). These two states are the presentation layer: whoever currently
+  // holds the winner slot, and the pool of substitutes available to swap in.
+  const [displayWinners, setDisplayWinners] = useState<DrawPerson[]>([]);
+  const [swapAlternates, setSwapAlternates] = useState<DrawPerson[]>([]);
   const [drawId, setDrawId] = useState("");
   const [isSaving, setIsSaving] = useState(false);
   const [saveError, setSaveError] = useState("");
@@ -616,6 +644,34 @@ export default function RaffleApp() {
     window.scrollTo({ top: 0, behavior: "smooth" });
   }, [stage]);
 
+  // Generated videos are disposable. When the tab is closed or reloaded we
+  // revoke the local blob and delete the temporary server copy.
+  useEffect(() => {
+    const release = () => {
+      if (videoUrl) {
+        try {
+          URL.revokeObjectURL(videoUrl);
+        } catch {
+          // ignore
+        }
+      }
+      const id = serverVideoId(serverDownloadUrl);
+      if (id) {
+        try {
+          void fetch(`/api/export-video/${id}`, { method: "DELETE", keepalive: true }).catch(() => undefined);
+        } catch {
+          // ignore
+        }
+      }
+    };
+    window.addEventListener("pagehide", release);
+    window.addEventListener("beforeunload", release);
+    return () => {
+      window.removeEventListener("pagehide", release);
+      window.removeEventListener("beforeunload", release);
+    };
+  }, [videoUrl, serverDownloadUrl]);
+
   function notify(message: string) {
     setToast(message);
     if (toastTimer.current) clearTimeout(toastTimer.current);
@@ -627,6 +683,8 @@ export default function RaffleApp() {
     videoAbort.current = null;
     photoAbort.current?.abort();
     photoAbort.current = null;
+    // Every generated video is thrown away together with its server copy.
+    releaseVideoAssets(videoUrl, serverDownloadUrl);
     setIsGeneratingVideo(false);
     setIsConvertingVideo(false);
     setIsPreparingDownload(false);
@@ -637,12 +695,18 @@ export default function RaffleApp() {
     setVideoError("");
     setVideoProgress(0);
     setVideoWinnerIndex(0);
+  }
+
+  function resetWinnerSlots() {
+    setDisplayWinners([]);
+    setSwapAlternates([]);
     setWinnerPhotos({});
   }
 
   function goHome() {
     if (animationTimer.current) clearTimeout(animationTimer.current);
     clearResultMedia();
+    resetWinnerSlots();
     setIsSpinning(false);
     setStage("start");
     setFormError("");
@@ -650,6 +714,7 @@ export default function RaffleApp() {
 
   function loadDemo() {
     clearResultMedia();
+    resetWinnerSlots();
     const demoUrl = "https://www.instagram.com/p/C9zQx5JvRkA/";
     setUrlInput(demoUrl);
     setSourceUrl(demoUrl);
@@ -852,6 +917,7 @@ export default function RaffleApp() {
       return;
     }
     clearResultMedia();
+    resetWinnerSlots();
     setDrawOutcome(null);
     setDrawId("");
     setSaveError("");
@@ -907,32 +973,38 @@ export default function RaffleApp() {
     photoAbort.current?.abort();
     const knownPhotos: Record<string, string> = {};
     for (const winner of outcome.winners) {
-      const entry = eligibleEntries[winner.entryNumber - 1];
+      const entry = eligibleEntries.find((person) => person.entryNumber === winner.entryNumber);
       if (entry?.profileImageUrl) knownPhotos[normalizeHandle(winner.username)] = entry.profileImageUrl;
     }
     setWinnerPhotos(knownPhotos);
     const missing = outcome.winners
       .map((winner) => normalizeHandle(winner.username))
       .filter((username) => !knownPhotos[username]);
-    if (!findWinnerPhotos || sourceMode === "demo" || !missing.length) {
+    fetchPhotosFor(missing);
+  }
+
+  function fetchPhotosFor(usernames: string[]) {
+    const unique = [...new Set(usernames.map(normalizeHandle).filter(Boolean))];
+    if (!findWinnerPhotos || sourceMode === "demo" || !unique.length) {
       setIsLoadingPhotos(false);
       return;
     }
 
+    photoAbort.current?.abort();
     const controller = new AbortController();
     photoAbort.current = controller;
     setIsLoadingPhotos(true);
     void fetch("/api/winner-photos", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ usernames: missing, confirmCost: true }),
+      body: JSON.stringify({ usernames: unique, confirmCost: true }),
       signal: controller.signal,
     })
       .then(async (response) => response.ok ? (await response.json()) as { photos?: Record<string, string> } : null)
       .then((data) => {
         if (controller.signal.aborted || !data?.photos) return;
         const valid = Object.fromEntries(
-          Object.entries(data.photos).filter(([username, url]) => missing.includes(username) && typeof url === "string" && url.startsWith("/api/profile-image?url=")),
+          Object.entries(data.photos).filter(([username, url]) => unique.includes(username) && typeof url === "string" && url.startsWith("/api/profile-image?url=")),
         );
         setWinnerPhotos((current) => ({ ...current, ...valid }));
       })
@@ -943,6 +1015,44 @@ export default function RaffleApp() {
           setIsLoadingPhotos(false);
         }
       });
+  }
+
+  /**
+   * Swap a substitute into the principal winner slot. The displaced winner
+   * goes back to the substitutes list, so the swap can be undone by clicking
+   * it again. Any video already generated is discarded first.
+   */
+  function promoteAlternate(person: DrawPerson) {
+    if (!drawOutcome || !displayWinners.length) return;
+    const poolIndex = swapAlternates.findIndex(
+      (entry) => entry.entryNumber === person.entryNumber && entry.username === person.username,
+    );
+    if (poolIndex < 0) return;
+    const displaced = displayWinners[0];
+    if (displaced.entryNumber === person.entryNumber) return;
+
+    const nextWinners = [...displayWinners];
+    nextWinners[0] = person;
+    const nextPool = [...swapAlternates];
+    nextPool[poolIndex] = displaced;
+
+    // Drop the animation/video made for the previous holder of the slot.
+    clearResultMedia();
+    setDisplayWinners(nextWinners);
+    setSwapAlternates(nextPool);
+    setVideoWinnerIndex(0);
+
+    const handle = normalizeHandle(person.username);
+    const knownPhoto =
+      winnerPhotos[handle] ||
+      eligibleEntries.find((entry) => entry.entryNumber === person.entryNumber)?.profileImageUrl;
+    if (knownPhoto) {
+      setWinnerPhotos((current) => ({ ...current, [handle]: knownPhoto }));
+    } else {
+      fetchPhotosFor([person.username]);
+    }
+
+    notify(`@${person.username} assumiu o lugar de @${displaced.username}. O vídeo anterior foi descartado; gere um novo quando quiser.`);
   }
 
   function startDraw() {
@@ -960,6 +1070,8 @@ export default function RaffleApp() {
 
     const outcome = chooseDraw(entries, winnerCount, alternateCount);
     setDrawOutcome(outcome);
+    setDisplayWinners(outcome.winners);
+    setSwapAlternates(outcome.alternates);
     setDrawId("");
     setSaveError("");
     setIsSpinning(true);
@@ -996,6 +1108,7 @@ export default function RaffleApp() {
 
   function startAnotherDraw() {
     clearResultMedia();
+    resetWinnerSlots();
     setDrawOutcome(null);
     setDrawId("");
     setSaveError("");
@@ -1006,8 +1119,10 @@ export default function RaffleApp() {
 
   async function makeWinnerVideo() {
     if (!drawOutcome || isGeneratingVideo) return;
-    const winner = drawOutcome.winners[videoWinnerIndex];
+    const winner = displayWinners[videoWinnerIndex] ?? displayWinners[0];
     if (!winner) return;
+    // Any previously generated file is discarded before a new render.
+    releaseVideoAssets(videoUrl, serverDownloadUrl);
     const controller = new AbortController();
     videoAbort.current = controller;
     setVideoUrl("");
@@ -1073,7 +1188,7 @@ export default function RaffleApp() {
 
   async function downloadWinnerVideo() {
     if (!drawOutcome || !videoUrl || !videoBlob || isPreparingDownload) return;
-    const name = `sorteio-super-connect-${drawOutcome.winners[videoWinnerIndex]?.username || "ganhador"}.${videoExtension}`;
+    const name = `sorteio-super-connect-${(displayWinners[videoWinnerIndex] ?? displayWinners[0])?.username || "ganhador"}.${videoExtension}`;
     try {
       const anchor = document.createElement("a");
       anchor.href = videoUrl;
@@ -1110,9 +1225,13 @@ export default function RaffleApp() {
 
   async function copyResult() {
     if (!drawOutcome) return;
-    const lines = drawOutcome.winners.map((winner, index) => {
+    const lines = displayWinners.map((winner, index) => {
       const prize = prizeEnabled ? prizeList[index] : "";
-      return `${index + 1}º vencedor: @${winner.username}${prize ? ` — ${prize}` : ""} (entrada #${winner.entryNumber})`;
+      const substituted =
+        index === 0 && drawOutcome.winners[0]?.entryNumber !== winner.entryNumber
+          ? " (suplente assumiu o lugar do sorteado principal)"
+          : "";
+      return `${index + 1}º vencedor: @${winner.username}${prize ? ` — ${prize}` : ""} (entrada #${winner.entryNumber})${substituted}`;
     });
     const text = `🎉 Resultado do sorteio\n${lines.join("\n")}\nParticipações elegíveis: ${eligibleEntries.length}\nPublicação: ${sourceUrl}`;
     try {
@@ -1127,14 +1246,14 @@ export default function RaffleApp() {
     if (!drawOutcome) return;
     const rows = [
       ["posição", "perfil", "número da entrada", "comentário", "prêmio"],
-      ...drawOutcome.winners.map((winner, index) => [
+      ...displayWinners.map((winner, index) => [
         String(index + 1),
         `@${winner.username}`,
         String(winner.entryNumber),
         winner.comment,
         prizeEnabled ? (prizeList[index] || "") : "",
       ]),
-      ...drawOutcome.alternates.map((person, index) => [
+      ...swapAlternates.map((person, index) => [
         `suplente ${index + 1}`,
         `@${person.username}`,
         String(person.entryNumber),
@@ -1506,13 +1625,16 @@ export default function RaffleApp() {
             <section className="result-winners" aria-label="Vencedores do sorteio">
               <div className="result-section-heading"><div><span>O MOMENTO DA SORTE</span><h2>{drawOutcome.winners.length === 1 ? "Pessoa sorteada" : "Pessoas sorteadas"}</h2></div><span className="result-winner-count">{String(drawOutcome.winners.length).padStart(2, "0")}</span></div>
               <div className="result-winner-list">
-                {drawOutcome.winners.map((winner, index) => {
+                {displayWinners.map((winner, index) => {
                   const photo = winnerPhotos[normalizeHandle(winner.username)];
+                  const isSubstitute =
+                    index === 0 && drawOutcome.winners[0]?.entryNumber !== winner.entryNumber;
                   return (
                     <article className="winner-share-card" key={`${winner.username}-${winner.entryNumber}`}>
-                      <div className="winner-share-top"><span><Icon name="spark" size={15} /> SUPER CONNECT</span><span>{sourceMode === "demo" ? "DEMONSTRAÇÃO" : "SORTEIO FINALIZADO"}</span></div>
+                      <div className="winner-share-top"><span><Icon name="spark" size={15} /> SUPER CONNECT</span><span>{sourceMode === "demo" ? "DEMONSTRAÇÃO" : isSubstitute ? "SUPLENTE EM POSSE" : "SORTEIO FINALIZADO"}</span></div>
                       <div className="winner-share-body">
-                        <span className="winner-share-label">{drawOutcome.winners.length > 1 ? `GANHADOR(A) ${String(index + 1).padStart(2, "0")}` : "GANHADOR(A) DO SORTEIO"}</span>
+                        <span className="winner-share-label">{displayWinners.length > 1 ? `GANHADOR(A) ${String(index + 1).padStart(2, "0")}` : "GANHADOR(A) DO SORTEIO"}</span>
+                        {isSubstitute && <span className="winner-swap-badge"><Icon name="shield" size={12} /> Suplente assumiu o lugar do sorteado principal</span>}
                         {photo && <WinnerPhoto key={photo} src={photo} username={winner.username} />}
                         <h3>@{winner.username}</h3>
                         {prizeEnabled && prizeList[index] && <span className="winner-share-prize"><Icon name="gift" size={13} /> {prizeList[index]}</span>}
@@ -1531,13 +1653,13 @@ export default function RaffleApp() {
             <aside className="reel-panel" aria-labelledby="video-title">
               <div className="reel-panel-heading"><span className="reel-icon"><Icon name="instagram" size={20} /></span><span><strong>PARA COMPARTILHAR</strong><small>Stories & Reels</small></span></div>
               <div className={`reel-preview ${videoUrl ? "reel-preview--video" : ""}`}>
-                {videoUrl ? <video src={videoUrl} controls playsInline preload="metadata" aria-label="Prévia do vídeo do sorteio" /> : <div className="reel-preview-art"><span>SUPER CONNECT</span><strong>Chegou a hora de<br /><em>descobrir o nosso ganhador.</em></strong><div>@{drawOutcome.winners[videoWinnerIndex]?.username}</div><small>1080 × 1920</small></div>}
+                {videoUrl ? <video src={videoUrl} controls playsInline preload="metadata" aria-label="Prévia do vídeo do sorteio" /> : <div className="reel-preview-art"><span>SUPER CONNECT</span><strong>Chegou a hora de<br /><em>descobrir o nosso ganhador.</em></strong><div>@{displayWinners[videoWinnerIndex]?.username}</div><small>1080 × 1920</small></div>}
               </div>
               <div className="reel-copy">
                 <h2 id="video-title">Seu sorteio em vídeo.</h2>
                 <p>Crie uma animação vertical com a roleta e o comentário do ganhador, pronta para compartilhar.</p>
-                {drawOutcome.winners.length > 1 && <label className="video-select-label" htmlFor="video-winner">Ganhador do vídeo<select id="video-winner" value={videoWinnerIndex} disabled={isGeneratingVideo} onChange={(event) => { setVideoWinnerIndex(Number(event.target.value)); setVideoUrl(""); setVideoBlob(null); setServerDownloadUrl(""); setVideoError(""); }}>
-                  {drawOutcome.winners.map((winner, index) => <option value={index} key={`${winner.username}-${index}`}>@{winner.username}</option>)}
+                {displayWinners.length > 1 && <label className="video-select-label" htmlFor="video-winner">Ganhador do vídeo<select id="video-winner" value={videoWinnerIndex} disabled={isGeneratingVideo} onChange={(event) => { clearResultMedia(); setVideoWinnerIndex(Number(event.target.value)); }}>
+                  {displayWinners.map((winner, index) => <option value={index} key={`${winner.username}-${index}`}>@{winner.username}</option>)}
                 </select></label>}
                 {isGeneratingVideo ? <div className="video-progress" role="status"><div><span>{isConvertingVideo ? "Convertendo para MP4" : "Preparando seu vídeo"}</span><strong>{isConvertingVideo ? "Aguarde" : `${videoProgress}%`}</strong></div>{isConvertingVideo ? <progress max={100} /> : <progress value={videoProgress} max={100} />}<small>Mantenha esta aba aberta até finalizar.</small></div> : videoUrl ? <div className="video-ready-actions"><button className="primary-button reel-action" type="button" onClick={() => void downloadWinnerVideo()} disabled={isPreparingDownload}><Icon name="download" size={16} /> {isPreparingDownload ? "Preparando download…" : `Baixar vídeo ${videoExtension.toUpperCase()}`}</button>{serverDownloadUrl && <a className="reel-regenerate" href={serverDownloadUrl} download={`sorteio-super-connect.${videoExtension}`}><Icon name="download" size={13} /> Link alternativo de download</a>}<a className="reel-regenerate" href={videoUrl} target="_blank" rel="noreferrer"><Icon name="external" size={13} /> Abrir vídeo para compartilhar</a><button className="reel-regenerate" type="button" onClick={() => void makeWinnerVideo()}><Icon name="refresh" size={13} /> Gerar novamente</button></div> : <button className="primary-button reel-action" type="button" onClick={() => void makeWinnerVideo()}><Icon name="play" size={16} /> Gerar vídeo vertical <Icon name="arrowRight" size={15} /></button>}
                 {videoError && <p className="video-error" role="alert">{videoError}</p>}
@@ -1547,9 +1669,38 @@ export default function RaffleApp() {
             </aside>
           </div>
 
-          {drawOutcome.alternates.length > 0 && <section className="alternate-panel"><h2>Suplentes sorteados</h2><p>Em ordem de seleção, caso um vencedor não cumpra as regras.</p><div className="alternate-list">{drawOutcome.alternates.map((person, index) => <span className="alternate-chip" key={`${person.username}-${person.entryNumber}`}><span>{String(index + 1).padStart(2, "0")}</span>@{person.username} · entrada #{String(person.entryNumber).padStart(2, "0")}</span>)}</div></section>}
+          {swapAlternates.length > 0 && (
+            <section className="alternate-panel alternate-panel--interactive">
+              <h2>Suplentes sorteados</h2>
+              <p>
+                Clique em um suplente para ele assumir o lugar do ganhador principal na tela e no vídeo.
+                O vídeo já gerado é apagado na troca e pode ser gerado novamente.
+              </p>
+              <div className="alternate-list">
+                {swapAlternates.map((person, index) => {
+                  const isOriginalWinner = drawOutcome.winners.some(
+                    (winner) => winner.entryNumber === person.entryNumber,
+                  );
+                  return (
+                    <button
+                      type="button"
+                      className={`alternate-chip alternate-chip--action${isOriginalWinner ? " alternate-chip--original" : ""}`}
+                      key={`${person.username}-${person.entryNumber}`}
+                      onClick={() => promoteAlternate(person)}
+                      aria-label={`Colocar @${person.username} no lugar do ganhador principal`}
+                      title="Clique para colocar no lugar do ganhador principal"
+                    >
+                      <span>{isOriginalWinner ? <Icon name="trophy" size={11} /> : String(index + 1).padStart(2, "0")}</span>
+                      @{person.username} · entrada #{String(person.entryNumber).padStart(2, "0")}
+                      <em>{isOriginalWinner ? "voltar ao lugar" : "assumir o lugar"}</em>
+                    </button>
+                  );
+                })}
+              </div>
+            </section>
+          )}
 
-          <details className="result-details"><summary><span><Icon name="shield" size={15} /> Detalhes do sorteio</span><span>＋</span></summary><p>A seleção foi feita aleatoriamente antes da animação, entre as entradas elegíveis.</p><div className="audit-grid"><div className="audit-cell"><span>Entradas elegíveis</span><strong>{eligibleEntries.length.toLocaleString("pt-BR")}</strong></div><div className="audit-cell"><span>Perfis únicos</span><strong>{uniqueEligibleCount.toLocaleString("pt-BR")}</strong></div><div className="audit-cell"><span>Número vencedor</span><strong>#{String(drawOutcome.winners[0]?.entryNumber || 0).padStart(2, "0")}</strong></div></div></details>
+          <details className="result-details"><summary><span><Icon name="shield" size={15} /> Detalhes do sorteio</span><span>＋</span></summary><p>A seleção foi feita aleatoriamente antes da animação, entre as entradas elegíveis.</p><div className="audit-grid"><div className="audit-cell"><span>Entradas elegíveis</span><strong>{eligibleEntries.length.toLocaleString("pt-BR")}</strong></div><div className="audit-cell"><span>Perfis únicos</span><strong>{uniqueEligibleCount.toLocaleString("pt-BR")}</strong></div><div className="audit-cell"><span>Número em exibição</span><strong>#{String(displayWinners[0]?.entryNumber || 0).padStart(2, "0")}</strong></div></div></details>
 
           <div className="result-actions result-secondary-actions">
             <button type="button" className="action-button" onClick={() => void copyResult()}><Icon name="copy" size={15} /> Copiar resultado</button>

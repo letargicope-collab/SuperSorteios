@@ -18,6 +18,11 @@ export function saveVideoDownload(data: Buffer, mimeType: string, extension: "mp
   return `/api/export-video/${id}`;
 }
 
+export function deleteVideoDownload(id: string): boolean {
+  if (!/^[a-f0-9]{32}$/.test(id)) return false;
+  return store.videos.delete(id);
+}
+
 export function getVideoDownload(id: string): DownloadRecord | undefined {
   if (!/^[a-f0-9]{32}$/.test(id)) return undefined;
   const item = store.videos.get(id);

@@ -1,4 +1,4 @@
-import { getVideoDownload } from "@/lib/video-downloads";
+import { deleteVideoDownload, getVideoDownload } from "@/lib/video-downloads";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -25,4 +25,13 @@ export async function GET(
       "X-Content-Type-Options": "nosniff",
     },
   });
+}
+
+export async function DELETE(
+  _request: Request,
+  { params }: { params: Promise<{ id: string }> },
+) {
+  const { id } = await params;
+  deleteVideoDownload(id);
+  return new Response(null, { status: 204, headers: { "Cache-Control": "no-store" } });
 }
